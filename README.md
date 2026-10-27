@@ -11,6 +11,13 @@ cmake -S . -B build -G Ninja && ninja -C build      # needs ../CinematicRAWStudi
 ./build/craw-tui ~/Movies/takes                      # or: craw-tui take.craw ...
 ```
 
+Imports both CRAW-Live and CRAW-Fast automatically; the codec stored in
+each frame selects the decoder. Rebuild after updating the sibling decoder
+to pick up its WAV export fixes. CinemaDNG audio exports use integer PCM
+(16-bit source stays 16-bit; float becomes 24-bit) with Broadcast WAV
+timecode. In Resolve, place video and WAV at the same timeline start;
+the automatic audio synchronization dialog has crashed with these takes.
+
 ## Interactive
 
 Browser (Enter opens folders, imports takes) · media pool (Space marks) ·
