@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Export.h"
+#include "Process.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,19 +17,13 @@ namespace fs = std::filesystem;
 namespace craw::tui {
 namespace {
 
-std::string shellQuote(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) out += c == '\'' ? std::string("'\\''") : std::string(1, c);
-    return out + "'";
-}
-
 std::string capture(const std::string& cmd) {
     std::string out;
-    if (std::FILE* p = ::popen(cmd.c_str(), "r")) {
+    if (std::FILE* p = process::open(cmd, false)) {
         char buf[4096];
         size_t n;
         while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
-        ::pclose(p);
+        process::close(p);
     }
     return out;
 }
@@ -84,10 +79,10 @@ const CodecProfile* findProfile(const std::string& id) {
     return nullptr;
 }
 
-bool ffmpegAvailable() { return !capture("command -v ffmpeg 2>/dev/null").empty(); }
+bool ffmpegAvailable() { return capture("ffmpeg -version").find("ffmpeg version") != std::string::npos; }
 
 std::vector<const CodecProfile*> availableProfiles() {
-    static const std::string encoders = ffmpegAvailable() ? capture("ffmpeg -hide_banner -encoders 2>/dev/null") : "";
+    static const std::string encoders = ffmpegAvailable() ? capture("ffmpeg -hide_banner -encoders") : "";
     std::vector<const CodecProfile*> out;
     for (const auto& p : codecProfiles())
         if (!*p.encoder || encoders.find(std::string(" ") + p.encoder + " ") != std::string::npos) out.push_back(&p);
@@ -150,12 +145,11 @@ ExportResult runExport(const ExportOptions& o, const std::function<void(size_t, 
             std::snprintf(rate, sizeof rate, "%.6g", fps);
             std::string cmd = "ffmpeg -hide_banner -loglevel error -y -f rawvideo -pix_fmt rgb48le -s " +
                               std::to_string(ow) + "x" + std::to_string(oh) + " -r " + rate + " -i -";
-            if (!wavPath.empty()) cmd += " -i " + shellQuote(wavPath) + " -map 0:v -map 1:a " + o.profile->audio;
+            if (!wavPath.empty()) cmd += " -i " + process::quote(wavPath) + " -map 0:v -map 1:a " + o.profile->audio;
             cmd += std::string(" -c:v ") + o.profile->encoder + " " + o.profile->args + " -pix_fmt " + o.profile->pixfmt +
-                   colourArgs(o.develop.gamut, o.develop.transfer) + " " + shellQuote(out.string());
+                   colourArgs(o.develop.gamut, o.develop.transfer) + " " + process::quote(out.string());
             const std::string log = (fs::path(o.outputDir) / ("." + stem + ".ffmpeg.log")).string();
-            cmd += " 2> " + shellQuote(log);
-            std::FILE* pipe = ::popen(cmd.c_str(), "w");
+            std::FILE* pipe = process::open(cmd, true, log);
             if (!pipe) throw std::runtime_error("cannot start ffmpeg");
             // Pipeline: `window` frames decode + develop concurrently (each with a
             // share of the cores) while frames are written to FFmpeg in order.
@@ -185,12 +179,12 @@ ExportResult runExport(const ExportOptions& o, const std::function<void(size_t, 
                 }
             } catch (...) {
                 for (auto& f : inflight) if (f.valid()) f.wait();
-                ::pclose(pipe);
+                process::close(pipe);
                 if (!wavPath.empty()) fs::remove(wavPath);
                 throw;
             }
             for (auto& f : inflight) if (f.valid()) f.wait();
-            const int status = ::pclose(pipe);
+            const int status = process::close(pipe);
             if (!wavPath.empty()) fs::remove(wavPath);
             if (cancel && *cancel) throw std::runtime_error("cancelled");
             if (broken || status != 0) {

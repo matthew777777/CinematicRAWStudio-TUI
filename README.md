@@ -18,6 +18,29 @@ to pick up its WAV export fixes. CinemaDNG audio exports use integer PCM
 timecode. In Resolve, place video and WAV at the same timeline start;
 the automatic audio synchronization dialog has crashed with these takes.
 
+## Easy install: Mac, Linux and Windows
+
+Install the complete toolset once with the
+[shared installer](https://github.com/matthew777777/CinematicRAWStudio-Spec/blob/main/GETTING_STARTED.md).
+It fetches the sibling repos and dependencies automatically.
+
+Mac/Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/matthew777777/CinematicRAWStudio-Spec/main/scripts/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/matthew777777/CinematicRAWStudio-Spec/main/scripts/install.ps1)))
+```
+
+Open a new terminal, then use `craw` for the editor,
+`craw mount "take.craw"` for Resolve, `craw unmount` to close mounts,
+or `craw export "take.craw"` to save CinemaDNG and sound.
+
+
 ## Interactive
 
 Browser (Enter opens folders, imports takes) · media pool (Space marks) ·
