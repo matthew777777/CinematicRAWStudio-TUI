@@ -133,7 +133,8 @@ ExportResult runExport(const ExportOptions& o, const std::function<void(size_t, 
             r.output = dir.string();
         } else {
             const auto [w, h] = clip.frameSize();
-            const uint32_t ow = o.develop.halfResolution ? w / 2 : w, oh = o.develop.halfResolution ? h / 2 : h;
+            const bool half = o.develop.halfResolution || clip.isRgb();  // RGB frames develop at picture size
+            const uint32_t ow = half ? w / 2 : w, oh = half ? h / 2 : h;
             const fs::path out = fs::path(o.outputDir) /
                                  (stem + "_" + o.profile->id + "_" + transferName(o.develop.transfer) + o.profile->extension);
             std::string wavPath;

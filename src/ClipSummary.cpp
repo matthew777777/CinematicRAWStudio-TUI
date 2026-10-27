@@ -16,12 +16,12 @@ ClipSummary ClipSummary::load(const std::string& path) {
         const tools::Clip clip(path);
         const auto& i = clip.info();
         s.frames = clip.frameCount();
-        std::tie(s.width, s.height) = clip.frameSize();
+        std::tie(s.width, s.height) = clip.imageSize();
         s.fps = i.fpsNum / i.fpsDen;
         s.seconds = s.fps > 0 ? s.frames / s.fps : 0;
         s.camera = i.uniqueModel;
-        static const char* cfa[] = {"RGGB", "GRBG", "GBRG", "BGGR"};
-        s.cfa = cfa[i.cfa & 3];
+        static const char* cfa[] = {"RGGB", "GRBG", "GBRG", "BGGR", "RGB (binned)"};
+        s.cfa = cfa[std::min<int>(clip.isRgb() ? 4 : i.cfa & 3, 4)];
         s.black = i.black[0];
         s.white = i.white;
         if (s.frames && s.width) s.bitsPerPixel = 8.0 * s.fileBytes / (double(s.width) * s.height * s.frames);

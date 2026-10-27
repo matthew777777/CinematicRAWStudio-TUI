@@ -224,11 +224,14 @@ void develop(const tools::RawFrame& raw, const tools::ClipInfo& info, const Deve
              std::vector<uint16_t>& rgb, uint32_t& outW, uint32_t& outH, unsigned threads) {
     const uint32_t W = raw.width, H = raw.height;
     // Colour of each cell position (py * 2 + px): 0 R, 1 G, 2 B; shading plane 0 R, 1 Gr, 2 Gb, 3 B.
-    static const int kColour[4][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}};
-    const int* colour = kColour[raw.cfa & 3];
+    // RGB frames (cfa 4, SPEC 3.8): cells R, G / B, unused; one pixel per cell.
+    static const int kColour[5][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}, {0, 1, 2, -1}};
+    const bool rgbCells = raw.cfa == 4;
+    const int* colour = kColour[rgbCells ? 4 : raw.cfa & 3];
     int plane[4];
     for (int pos = 0; pos < 4; ++pos) {
         const int c = colour[pos];
+        if (rgbCells) { plane[pos] = c == 0 ? 0 : c == 2 ? 3 : 1; continue; }
         if (c != 1) { plane[pos] = c == 0 ? 0 : 3; continue; }
         const int rowHasRed = colour[(pos & 2)] == 0 || colour[(pos & 2) | 1] == 0;
         plane[pos] = rowHasRed ? 1 : 2;
@@ -302,8 +305,9 @@ void develop(const tools::RawFrame& raw, const tools::ClipInfo& info, const Deve
     });
 
     // 2. Demosaic, colour, transfer.
-    outW = s.halfResolution ? W / 2 : W;
-    outH = s.halfResolution ? H / 2 : H;
+    const bool half = s.halfResolution || rgbCells;
+    outW = half ? W / 2 : W;
+    outH = half ? H / 2 : H;
     rgb.resize(size_t{outW} * outH * 3);
     auto finish = [&](float r, float g, float b, uint16_t* o) {
         r *= inv[0];
@@ -326,12 +330,13 @@ void develop(const tools::RawFrame& raw, const tools::ClipInfo& info, const Deve
         o[1] = lut(G);
         o[2] = lut(B);
     };
-    if (s.halfResolution) {
+    if (half) {
         parallelRows(outH, [&](uint32_t y) {
             for (uint32_t x = 0; x < outW; ++x) {
                 double c[3] = {0, 0, 0};
                 int n[3] = {0, 0, 0};
                 for (int pos = 0; pos < 4; ++pos) {
+                    if (colour[pos] < 0) continue;
                     c[colour[pos]] += cfa[size_t(2 * y + (pos >> 1)) * W + 2 * x + (pos & 1)];
                     ++n[colour[pos]];
                 }
