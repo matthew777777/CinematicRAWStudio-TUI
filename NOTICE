@@ -1,0 +1,5 @@
+Cinematic RAW Studio TUI
+Copyright 2026 The Cinematic RAW Studio Authors
+
+Licensed under the Apache License, Version 2.0.
+Uses FTXUI (MIT, Arthur Sonzogni) and, at runtime, FFmpeg (LGPL/GPL, external process).
