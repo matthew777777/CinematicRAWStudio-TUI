@@ -14,7 +14,9 @@ cmake -S . -B build -G Ninja && ninja -C build      # needs ../CinematicRAWStudi
 ## Interactive
 
 Browser (Enter opens folders, imports takes) · media pool (Space marks) ·
-clip metadata · export settings · render queue with progress.
+truecolour preview of the selected take (half-block cells, developed in the
+background with the current look) · clip metadata · export settings or grade
+sliders · render queue with progress.
 
 | key | action |
 |-----|--------|
@@ -23,7 +25,9 @@ clip metadata · export settings · render queue with progress.
 | Space | mark take |
 | a / A | queue marked (or current) / all takes |
 | v (R) | render queue · x cancel |
-| c g t | cycle codec, gamut, transfer |
+| c f g t | cycle codec, frame rate, gamut, transfer |
+| G | grade mode: exposure, temperature, tint, contrast, saturation, highlights, shadows, blacks (live preview; 0 resets) |
+| , . / < > | preview frame ±1 / ±10 % |
 | e / E | exposure −/+ ⅓ EV |
 | l y h | lens-shading correction, highlight clipping, half resolution |
 | b ? q | toggle browser, help, quit |
@@ -53,3 +57,9 @@ ForwardMatrix (or inverted ColorMatrix) to XYZ D50 → Bradford to the target
 white → target primaries → exposure → transfer → rgb48le into FFmpeg, with
 colour tags (primaries / transfer / matrix) on the output. Audio is muxed
 from the take (PCM 24-bit in .mov, AAC in .mp4).
+
+Export is pipelined: several frames decode and develop concurrently while
+frames stream to FFmpeg in order. Transfer curves use a table indexed by the
+float bit pattern (no log/pow per sample; PSNR ~78 dB vs exact). On an
+8-core Mac, 40 frames of 4080x2040 to ProRes 422 HQ take ~8 s, of which
+FFmpeg's encoder alone needs ~4 s.

@@ -2,6 +2,8 @@
 #include "Develop.h"
 
 #include <algorithm>
+#include <cstring>
+#include <memory>
 #include <cmath>
 #include <thread>
 
@@ -150,6 +152,74 @@ double applyTransfer(Transfer t, double x) {
     }
 }
 
+void applyGrade(const DevelopSettings& s, double& r, double& g, double& b) {
+    double* c[3] = {&r, &g, &b};
+    if (s.blacks != 0)
+        for (double* v : c) *v = (*v - s.blacks) / (1 - s.blacks);
+    if (s.contrast != 1)
+        for (double* v : c)
+            if (*v > 0) *v = 0.18 * std::pow(*v / 0.18, s.contrast);
+    if (s.shadows != 0 || s.highlights != 0) {
+        // Tone the luminance, keep the ratios (no hue shifts).
+        const double y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if (y > 0) {
+            double t = y;
+            if (y < 0.18) t = y * (1 + s.shadows * (1 - y / 0.18));
+            else t = 0.18 + (y - 0.18) * std::exp2(s.highlights);
+            const double k = t / y;
+            for (double* v : c) *v *= k;
+        }
+    }
+    if (s.saturation != 1) {
+        const double y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        for (double* v : c) *v = y + (*v - y) * s.saturation;
+    }
+}
+
+namespace {
+
+// Transfer curve indexed by the float's bit pattern: the top 11 mantissa bits
+// plus the exponent give 2048 entries per stop over [2^-20, 2^12]; the next
+// 12 bits interpolate. No log2 per sample.
+class TransferLut {
+public:
+    explicit TransferLut(Transfer t) : t_(t) {
+        lut_.resize(kEntries + 1);
+        for (uint32_t i = 0; i <= kEntries; ++i) {
+            const uint32_t bits = (kBase + i) << kShift;
+            float x;
+            std::memcpy(&x, &bits, 4);
+            lut_[i] = static_cast<float>(std::clamp(applyTransfer(t, x), 0.0, 1.0));
+        }
+    }
+    uint16_t operator()(float x) const {
+        uint32_t bits;
+        std::memcpy(&bits, &x, 4);
+        float v;
+        if (!(x >= kMinValue)) {
+            v = static_cast<float>(std::clamp(applyTransfer(t_, std::max(x, 0.f)), 0.0, 1.0));
+        } else {
+            const uint32_t i = (bits >> kShift) - kBase;
+            if (i >= kEntries) v = lut_[kEntries];
+            else {
+                const float w = static_cast<float>(bits & ((1u << kShift) - 1)) * (1.f / (1u << kShift));
+                v = lut_[i] + (lut_[i + 1] - lut_[i]) * w;
+            }
+        }
+        return static_cast<uint16_t>(v * 65535.f + 0.5f);
+    }
+
+private:
+    static constexpr uint32_t kShift = 12;                  // 23 - 11 mantissa bits kept
+    static constexpr uint32_t kBase = (127u - 20u) << 11;   // 2^-20
+    static constexpr uint32_t kEntries = 32u << 11;         // 32 stops
+    static constexpr float kMinValue = 9.5367431640625e-07f;
+    Transfer t_;
+    std::vector<float> lut_;
+};
+
+}  // namespace
+
 void develop(const tools::RawFrame& raw, const tools::ClipInfo& info, const DevelopSettings& s,
              std::vector<uint16_t>& rgb, uint32_t& outW, uint32_t& outH, unsigned threads) {
     const uint32_t W = raw.width, H = raw.height;
@@ -172,17 +242,47 @@ void develop(const tools::RawFrame& raw, const tools::ClipInfo& info, const Deve
     // A sensor-clipped sample (1.0) white-balances to 1 / neutral; clamp every
     // channel to the lowest of those so clipped highlights stay neutral.
     const double clip = std::min({1 / raw.neutral[0], 1 / raw.neutral[1], 1 / raw.neutral[2]});
+    // Temperature / tint as gains on white-balanced camera RGB (1 stop at +-100).
+    const double wbR = std::exp2(s.temperature / 100), wbB = std::exp2(-s.temperature / 100);
+    const double wbG = std::exp2(-s.tint / 100);
+    static thread_local std::unique_ptr<TransferLut> lutCache;
+    static thread_local Transfer lutFor = Transfer::Count;
+    if (!lutCache || lutFor != s.transfer) { lutCache = std::make_unique<TransferLut>(s.transfer); lutFor = s.transfer; }
+    const TransferLut& lut = *lutCache;
+    const bool graded = s.contrast != 1 || s.saturation != 1 || s.highlights != 0 || s.shadows != 0 || s.blacks != 0;
+    // Per pixel: divide by neutral, clamp, then one 3x3 matrix that already holds
+    // temperature/tint gains and exposure.
+    const float inv[3] = {static_cast<float>(1 / raw.neutral[0]), static_cast<float>(1 / raw.neutral[1]),
+                          static_cast<float>(1 / raw.neutral[2])};
+    const float wbGain[3] = {static_cast<float>(wbR), static_cast<float>(wbG), static_cast<float>(wbB)};
+    float mf[9];
+    for (int i = 0; i < 9; ++i) mf[i] = static_cast<float>(m[i] * gain) * wbGain[i % 3];
+    const float clipF = static_cast<float>(clip);
 
     // 1. Normalized, lens-corrected CFA as float.
     std::vector<float> cfa(size_t{W} * H);
+    // Lens-shading bilinear weights per column and row (grid points at cell centres).
+    struct Tap { int i0, i1; float w; };
+    std::vector<Tap> colTap, rowTap;
+    if (shade) {
+        auto taps = [](uint32_t n, int points, std::vector<Tap>& out) {
+            out.resize(n);
+            for (uint32_t k = 0; k < n; ++k) {
+                const double g = std::clamp((k + 0.5) / n * points - 0.5, 0.0, points - 1.0);
+                const int i0 = static_cast<int>(g);
+                out[k] = {i0, std::min(i0 + 1, points - 1), static_cast<float>(g - i0)};
+            }
+        };
+        taps(W, raw.shadingColumns, colTap);
+        taps(H, raw.shadingRows, rowTap);
+    }
     auto shadingGain = [&](uint32_t x, uint32_t y, int p) -> float {
-        const double gx = std::clamp((x + 0.5) / W * raw.shadingColumns - 0.5, 0.0, raw.shadingColumns - 1.0);
-        const double gy = std::clamp((y + 0.5) / H * raw.shadingRows - 0.5, 0.0, raw.shadingRows - 1.0);
-        const int x0 = static_cast<int>(gx), y0 = static_cast<int>(gy);
-        const int x1 = std::min(x0 + 1, raw.shadingColumns - 1), y1 = std::min(y0 + 1, raw.shadingRows - 1);
-        const double tx = gx - x0, ty = gy - y0;
+        const Tap& cx = colTap[x];
+        const Tap& ry = rowTap[y];
         auto at = [&](int xx, int yy) { return raw.shadingGains[(size_t(yy) * raw.shadingColumns + xx) * 4 + p]; };
-        return static_cast<float>((at(x0, y0) * (1 - tx) + at(x1, y0) * tx) * (1 - ty) + (at(x0, y1) * (1 - tx) + at(x1, y1) * tx) * ty);
+        const float top = at(cx.i0, ry.i0) + (at(cx.i1, ry.i0) - at(cx.i0, ry.i0)) * cx.w;
+        const float bot = at(cx.i0, ry.i1) + (at(cx.i1, ry.i1) - at(cx.i0, ry.i1)) * cx.w;
+        return top + (bot - top) * ry.w;
     };
     auto parallelRows = [&](uint32_t rows, auto&& fn) {
         const unsigned n = std::max(1u, std::min(threads, rows));
@@ -205,24 +305,26 @@ void develop(const tools::RawFrame& raw, const tools::ClipInfo& info, const Deve
     outW = s.halfResolution ? W / 2 : W;
     outH = s.halfResolution ? H / 2 : H;
     rgb.resize(size_t{outW} * outH * 3);
-    auto finish = [&](double r, double g, double b, uint16_t* o) {
-        r /= raw.neutral[0];
-        g /= raw.neutral[1];
-        b /= raw.neutral[2];
+    auto finish = [&](float r, float g, float b, uint16_t* o) {
+        r *= inv[0];
+        g *= inv[1];
+        b *= inv[2];
         if (s.clipHighlights) {
-            r = std::min(r, clip);
-            g = std::min(g, clip);
-            b = std::min(b, clip);
+            r = std::min(r, clipF);
+            g = std::min(g, clipF);
+            b = std::min(b, clipF);
         }
-        const double R = (m[0] * r + m[1] * g + m[2] * b) * gain;
-        const double G = (m[3] * r + m[4] * g + m[5] * b) * gain;
-        const double B = (m[6] * r + m[7] * g + m[8] * b) * gain;
-        auto q = [&](double v) {
-            return static_cast<uint16_t>(std::lround(std::clamp(applyTransfer(s.transfer, v), 0.0, 1.0) * 65535));
-        };
-        o[0] = q(R);
-        o[1] = q(G);
-        o[2] = q(B);
+        float R = mf[0] * r + mf[1] * g + mf[2] * b;
+        float G = mf[3] * r + mf[4] * g + mf[5] * b;
+        float B = mf[6] * r + mf[7] * g + mf[8] * b;
+        if (graded) {
+            double dr = R, dg = G, db = B;
+            applyGrade(s, dr, dg, db);
+            R = static_cast<float>(dr); G = static_cast<float>(dg); B = static_cast<float>(db);
+        }
+        o[0] = lut(R);
+        o[1] = lut(G);
+        o[2] = lut(B);
     };
     if (s.halfResolution) {
         parallelRows(outH, [&](uint32_t y) {
@@ -237,27 +339,61 @@ void develop(const tools::RawFrame& raw, const tools::ClipInfo& info, const Deve
             }
         });
     } else {
-        // Bilinear: own sample for its colour, mean of same-colour 3x3 neighbours otherwise.
-        parallelRows(H, [&](uint32_t y) {
-            for (uint32_t x = 0; x < W; ++x) {
-                double sum[3] = {0, 0, 0};
-                int n[3] = {0, 0, 0};
-                const int own = colour[(y & 1) * 2 + (x & 1)];
-                for (int dy = -1; dy <= 1; ++dy) {
-                    const int yy = std::clamp(static_cast<int>(y) + dy, 0, static_cast<int>(H) - 1);
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        if (!dx && !dy) continue;
-                        const int xx = std::clamp(static_cast<int>(x) + dx, 0, static_cast<int>(W) - 1);
-                        const int c = colour[(yy & 1) * 2 + (xx & 1)];
-                        sum[c] += cfa[size_t(yy) * W + xx];
-                        ++n[c];
-                    }
+        // Bilinear: own sample for its colour, mean of same-colour 3x3 neighbours
+        // otherwise. Offsets per cell position are precomputed; borders clamp.
+        struct Taps { int own; int n[3]; int off[3][8]; };
+        Taps taps[4];
+        for (int pos = 0; pos < 4; ++pos) {
+            Taps& t = taps[pos];
+            t.own = colour[pos];
+            t.n[0] = t.n[1] = t.n[2] = 0;
+            const int py = pos >> 1, px = pos & 1;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (!dx && !dy) continue;
+                    const int c = colour[((py + dy) & 1) * 2 + ((px + dx) & 1)];
+                    t.off[c][t.n[c]++] = dy * static_cast<int>(W) + dx;
                 }
-                double v[3];
-                for (int c = 0; c < 3; ++c) v[c] = n[c] ? sum[c] / n[c] : 0;
-                v[own] = cfa[size_t(y) * W + x];
-                finish(v[0], v[1], v[2], &rgb[(size_t(y) * W + x) * 3]);
+        }
+        auto pixelAt = [&](uint32_t x, uint32_t y, double v[3]) {
+            double sum[3] = {0, 0, 0};
+            int n[3] = {0, 0, 0};
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int yy = std::clamp(static_cast<int>(y) + dy, 0, static_cast<int>(H) - 1);
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (!dx && !dy) continue;
+                    const int xx = std::clamp(static_cast<int>(x) + dx, 0, static_cast<int>(W) - 1);
+                    const int c = colour[(yy & 1) * 2 + (xx & 1)];
+                    sum[c] += cfa[size_t(yy) * W + xx];
+                    ++n[c];
+                }
             }
+            for (int c = 0; c < 3; ++c) v[c] = n[c] ? sum[c] / n[c] : 0;
+            v[colour[(y & 1) * 2 + (x & 1)]] = cfa[size_t(y) * W + x];
+        };
+        parallelRows(H, [&](uint32_t y) {
+            uint16_t* out = &rgb[size_t(y) * W * 3];
+            double v[3];
+            if (y == 0 || y + 1 >= H) {
+                for (uint32_t x = 0; x < W; ++x) { pixelAt(x, y, v); finish(v[0], v[1], v[2], out + 3 * x); }
+                return;
+            }
+            pixelAt(0, y, v);
+            finish(v[0], v[1], v[2], out);
+            const float* row = cfa.data() + size_t(y) * W;
+            for (uint32_t x = 1; x + 1 < W; ++x) {
+                const Taps& t = taps[(y & 1) * 2 + (x & 1)];
+                const float* p = row + x;
+                for (int c = 0; c < 3; ++c) {
+                    if (c == t.own) { v[c] = *p; continue; }
+                    float acc = 0;
+                    for (int k = 0; k < t.n[c]; ++k) acc += p[t.off[c][k]];
+                    v[c] = acc / t.n[c];
+                }
+                finish(v[0], v[1], v[2], out + 3 * x);
+            }
+            pixelAt(W - 1, y, v);
+            finish(v[0], v[1], v[2], out + 3 * (W - 1));
         });
     }
 }

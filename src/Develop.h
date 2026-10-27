@@ -32,7 +32,19 @@ struct DevelopSettings {
     bool halfResolution = false;    // 2x2 superpixel instead of bilinear demosaic
     double blackOverride = -1;      // < 0: use recorded levels
     double whiteOverride = -1;
+
+    // Grade (scene-linear, before the transfer function). Neutral values: 0 / 1.
+    double temperature = 0;  // -100..100: warmer (+) / cooler (-), on white-balanced camera RGB
+    double tint = 0;         // -100..100: magenta (+) / green (-)
+    double contrast = 1;     // 0.5..2: log-space slope around 18 % grey
+    double saturation = 1;   // 0..2
+    double highlights = 0;   // -1..1: compress (-) / extend (+) above 18 % grey
+    double shadows = 0;      // -1..1: lift (+) / crush (-) below 18 % grey
+    double blacks = 0;       // -0.05..0.05: linear black offset
 };
+
+// Applies the grade to one scene-linear RGB triple in place.
+void applyGrade(const DevelopSettings& s, double& r, double& g, double& b);
 
 // Camera (white-balanced) -> target gamut, from ForwardMatrix1 or ColorMatrix1.
 Mat3 cameraToTarget(const tools::ClipInfo& info, const std::array<double, 3>& neutral, Gamut gamut);

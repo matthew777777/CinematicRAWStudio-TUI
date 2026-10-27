@@ -68,6 +68,30 @@ int main() {
     develop(raw, info, s, rgb, w, h, 2);
     check(w == 4 && h == 4 && rgb.size() == 48, "half resolution is 2x2 superpixel");
 
+    // Grade: neutral settings are an identity; each control moves values the expected way.
+    {
+        DevelopSettings g;
+        double r = 0.3, gg = 0.18, b = 0.05;
+        applyGrade(g, r, gg, b);
+        check(near(r, 0.3, 1e-12) && near(gg, 0.18, 1e-12) && near(b, 0.05, 1e-12), "neutral grade is identity");
+        g.saturation = 0;
+        r = 0.3; gg = 0.18; b = 0.05;
+        applyGrade(g, r, gg, b);
+        check(near(r, gg, 1e-12) && near(gg, b, 1e-12), "saturation 0 is monochrome");
+        g = DevelopSettings{};
+        g.contrast = 1.5;
+        double lo = 0.05, hi = 0.8, mid = 0.18, z = 0;
+        applyGrade(g, lo, z, z);
+        applyGrade(g, hi, z, z);
+        applyGrade(g, mid, z, z);
+        check(lo < 0.05 && hi > 0.8 && near(mid, 0.18, 1e-9), "contrast pivots on 18% grey");
+        g = DevelopSettings{};
+        g.shadows = 0.5;
+        double s1 = 0.05, s2 = 0.05, s3 = 0.05;
+        applyGrade(g, s1, s2, s3);
+        check(s1 > 0.05 && near(s1, s2, 1e-12), "shadows lift keeps neutral");
+    }
+
     std::printf("%d failures\n", failures);
     return failures != 0;
 }

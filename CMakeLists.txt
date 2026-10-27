@@ -26,7 +26,8 @@ add_library(craw_develop STATIC
     ${CRAW_DECODER_DIR}/tools/common/Clip.cpp
     src/Develop.cpp
     src/Export.cpp
-    src/ClipSummary.cpp)
+    src/ClipSummary.cpp
+    src/Thumbnail.cpp)
 target_include_directories(craw_develop PUBLIC src ${CRAW_DECODER_DIR}/include ${CRAW_DECODER_DIR}/tools)
 target_link_libraries(craw_develop PUBLIC Threads::Threads)
 target_compile_options(craw_develop PRIVATE -Wall -Wextra)

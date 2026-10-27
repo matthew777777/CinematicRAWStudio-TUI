@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Export.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <thread>
 
@@ -153,17 +156,39 @@ ExportResult runExport(const ExportOptions& o, const std::function<void(size_t, 
             cmd += " 2> " + shellQuote(log);
             std::FILE* pipe = ::popen(cmd.c_str(), "w");
             if (!pipe) throw std::runtime_error("cannot start ffmpeg");
-            std::vector<uint16_t> rgb;
-            uint32_t rw = 0, rh = 0;
+            // Pipeline: `window` frames decode + develop concurrently (each with a
+            // share of the cores) while frames are written to FFmpeg in order.
+            const unsigned window = std::clamp(threads / 2, 1u, 4u);
+            const unsigned perFrame = std::max(1u, threads / window);
+            struct Developed { std::vector<uint16_t> rgb; uint32_t w = 0, h = 0; };
+            auto job = [&](size_t i) {
+                Developed d;
+                const auto raw = clip.frameRaw(i, perFrame);
+                develop(raw, clip.info(), o.develop, d.rgb, d.w, d.h, perFrame);
+                return d;
+            };
+            std::deque<std::future<Developed>> inflight;
+            size_t next = 0;
             bool broken = false;
-            for (size_t i = 0; i < total && !broken; ++i) {
-                if (cancel && *cancel) { broken = true; break; }
-                const auto raw = clip.frameRaw(i, threads);
-                develop(raw, clip.info(), o.develop, rgb, rw, rh, threads);
-                if (rw != ow || rh != oh) throw std::runtime_error("frame size changed mid-take");
-                broken = std::fwrite(rgb.data(), 2, rgb.size(), pipe) != rgb.size();
-                if (!broken) progress(++r.frames, total);
+            try {
+                while (!broken && (next < total || !inflight.empty())) {
+                    while (next < total && inflight.size() < window && !(cancel && *cancel))
+                        inflight.push_back(std::async(std::launch::async, job, next++));
+                    if (inflight.empty()) break;
+                    Developed d = inflight.front().get();
+                    inflight.pop_front();
+                    if (d.w != ow || d.h != oh) throw std::runtime_error("frame size changed mid-take");
+                    broken = std::fwrite(d.rgb.data(), 2, d.rgb.size(), pipe) != d.rgb.size();
+                    if (!broken) progress(++r.frames, total);
+                    if (cancel && *cancel) broken = true;
+                }
+            } catch (...) {
+                for (auto& f : inflight) if (f.valid()) f.wait();
+                ::pclose(pipe);
+                if (!wavPath.empty()) fs::remove(wavPath);
+                throw;
             }
+            for (auto& f : inflight) if (f.valid()) f.wait();
             const int status = ::pclose(pipe);
             if (!wavPath.empty()) fs::remove(wavPath);
             if (cancel && *cancel) throw std::runtime_error("cancelled");

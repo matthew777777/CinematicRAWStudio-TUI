@@ -6,6 +6,7 @@
 
 #include "ClipSummary.h"
 #include "Export.h"
+#include "Thumbnail.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -13,6 +14,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <optional>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
@@ -40,6 +43,26 @@ const char* stateName(QueueItem::State s) {
         case QueueItem::State::Failed: return "failed";
         default: return "cancelled";
     }
+}
+
+constexpr uint32_t kThumbColumns = 56;
+constexpr double kFpsPresets[] = {0, 23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60};
+
+Element thumbnailElement(const Thumbnail& t) {
+    if (!t.error.empty()) return text("preview: " + t.error) | dim;
+    if (t.width == 0) return text("developing preview…") | dim;
+    Elements rows;
+    for (uint32_t y = 0; y + 1 < t.height; y += 2) {
+        Elements cells;
+        for (uint32_t x = 0; x < t.width; ++x) {
+            const uint8_t* a = &t.rgb[(size_t(y) * t.width + x) * 3];
+            const uint8_t* b = &t.rgb[(size_t(y + 1) * t.width + x) * 3];
+            cells.push_back(text("▀") | color(Color::RGB(a[0], a[1], a[2])) | bgcolor(Color::RGB(b[0], b[1], b[2])));
+        }
+        rows.push_back(hbox(std::move(cells)));
+    }
+    rows.push_back(text("frame " + std::to_string(t.frame + 1) + "/" + std::to_string(t.frames) + "   , . step   < > jump") | dim);
+    return vbox(std::move(rows));
 }
 
 template <typename E>
@@ -107,6 +130,15 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
     for (size_t i = 0; i < profiles.size(); ++i)
         if (std::string(profiles[i]->id) == "prores4444") profileIdx = static_cast<int>(i);
     DevelopSettings dev;
+    int fpsIdx = 0;
+    // Grade sliders (FTXUI edits floats); copied into `dev` every frame.
+    float gEv = 0, gTemp = 0, gTint = 0, gContrast = 1, gSat = 1, gHigh = 0, gShadow = 0, gBlacks = 0;
+    bool gradeMode = false;
+    size_t previewFrame = 0;
+    auto syncGrade = [&] {
+        dev.exposureEv = gEv; dev.temperature = gTemp; dev.tint = gTint; dev.contrast = gContrast;
+        dev.saturation = gSat; dev.highlights = gHigh; dev.shadows = gShadow; dev.blacks = gBlacks;
+    };
     std::string outDir = outputDir.empty() ? (cwd / "craw-export").string() : outputDir;
     std::string status = ffmpegAvailable() ? "ready" : "ffmpeg not found: only CinemaDNG export is available";
     bool showBrowser = true, showHelp = false;
@@ -116,6 +148,47 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
     std::vector<QueueItem> queue;
     std::atomic<bool> rendering{false}, cancel{false};
     std::thread worker;
+    // ---- preview thumbnails (background, latest request wins) ----
+    struct ThumbRequest { std::string path; size_t frame; DevelopSettings settings; uint64_t gen; };
+    std::mutex tm;
+    std::condition_variable tcv;
+    std::optional<ThumbRequest> pendingThumb;
+    Thumbnail thumb;
+    uint64_t thumbGen = 0;
+    bool thumbStop = false;
+    std::string thumbKey;
+    const unsigned previewThreads = std::max(2u, std::thread::hardware_concurrency() / 2);
+    std::thread thumbWorker([&] {
+        for (;;) {
+            ThumbRequest r;
+            {
+                std::unique_lock l(tm);
+                tcv.wait(l, [&] { return thumbStop || pendingThumb.has_value(); });
+                if (thumbStop) return;
+                r = *pendingThumb;
+                pendingThumb.reset();
+            }
+            Thumbnail t = makeThumbnail(r.path, r.frame, r.settings, kThumbColumns, previewThreads);
+            {
+                std::lock_guard l(tm);
+                if (r.gen == thumbGen) thumb = std::move(t);
+            }
+            screen.PostEvent(Event::Custom);
+        }
+    });
+    auto maybeRequestThumb = [&] {
+        if (poolSel < 0 || poolSel >= static_cast<int>(pool.size()) || !pool[poolSel].error.empty()) return;
+        char key[512];
+        std::snprintf(key, sizeof key, "%s|%zu|%d%d|%.3f%.1f%.1f%.2f%.2f%.2f%.2f%.3f|%d%d", pool[poolSel].path.c_str(), previewFrame,
+                      static_cast<int>(dev.gamut), static_cast<int>(dev.transfer), dev.exposureEv, dev.temperature, dev.tint,
+                      dev.contrast, dev.saturation, dev.highlights, dev.shadows, dev.blacks, dev.lensCorrection, dev.clipHighlights);
+        if (thumbKey == key) return;
+        thumbKey = key;
+        std::lock_guard l(tm);
+        pendingThumb = ThumbRequest{pool[poolSel].path, previewFrame, dev, ++thumbGen};
+        tcv.notify_one();
+    };
+
     auto enqueue = [&](const ClipSummary& c) {
         if (!c.error.empty()) return;
         QueueItem it;
@@ -125,6 +198,7 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
         it.options.outputDir = outDir;
         it.options.profile = profiles[profileIdx];
         it.options.develop = dev;
+        it.options.fpsOverride = kFpsPresets[fpsIdx];
         it.total = c.frames;
         std::lock_guard l(qm);
         queue.push_back(it);
@@ -182,14 +256,30 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
         }
     };
     auto browser = Menu(&browserEntries, &browserSel, browserOpt);
-    auto poolMenu = Menu(&poolEntries, &poolSel);
-    auto panes = Container::Horizontal({browser, poolMenu});
+    MenuOption poolOpt;
+    poolOpt.on_change = [&] { previewFrame = 0; };
+    auto poolMenu = Menu(&poolEntries, &poolSel, poolOpt);
+    auto sliders = Container::Vertical({
+        Slider("Exposure   ", &gEv, -4.f, 4.f, 0.1f),
+        Slider("Temperature", &gTemp, -100.f, 100.f, 2.f),
+        Slider("Tint       ", &gTint, -100.f, 100.f, 2.f),
+        Slider("Contrast   ", &gContrast, 0.5f, 2.f, 0.02f),
+        Slider("Saturation ", &gSat, 0.f, 2.f, 0.02f),
+        Slider("Highlights ", &gHigh, -1.f, 1.f, 0.02f),
+        Slider("Shadows    ", &gShadow, -1.f, 1.f, 0.02f),
+        Slider("Blacks     ", &gBlacks, -0.05f, 0.05f, 0.001f),
+    });
+    auto panes = Container::Horizontal({browser, poolMenu, Maybe(sliders, &gradeMode)});
 
     auto settingsRows = [&] {
         char ev[32];
         std::snprintf(ev, sizeof ev, "%+.2f EV", dev.exposureEv);
+        char fps[32];
+        if (kFpsPresets[fpsIdx] > 0) std::snprintf(fps, sizeof fps, "%.3g fps", kFpsPresets[fpsIdx]);
+        else std::snprintf(fps, sizeof fps, "clip rate");
         return vbox({
             hbox({text("codec      [c] "), text(profiles[profileIdx]->label) | bold}),
+            hbox({text("frame rate [f] "), text(fps) | bold}),
             hbox({text("gamut      [g] "), text(gamutName(dev.gamut)) | bold}),
             hbox({text("transfer   [t] "), text(transferName(dev.transfer)) | bold}),
             hbox({text("exposure [e/E] "), text(ev) | bold}),
@@ -201,6 +291,13 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
     };
 
     auto renderer = Renderer(panes, [&] {
+        syncGrade();
+        maybeRequestThumb();
+        Thumbnail shown;
+        {
+            std::lock_guard l(tm);
+            shown = thumb;
+        }
         Elements meta;
         if (poolSel >= 0 && poolSel < static_cast<int>(pool.size()))
             for (const auto& [k, v] : pool[poolSel].rows())
@@ -221,12 +318,15 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
         }
         auto browserPane = window(text(" Browser: " + cwd.string() + " "), browser->Render() | vscroll_indicator | frame);
         auto poolPane = window(text(" Media pool "), poolMenu->Render() | vscroll_indicator | frame);
-        auto right = vbox({window(text(" Clip "), vbox(meta)), window(text(" Export "), settingsRows())});
-        Element top = showBrowser ? hbox({browserPane | flex, poolPane | flex, right | size(WIDTH, GREATER_THAN, 52)})
-                                  : hbox({poolPane | flex, right | size(WIDTH, GREATER_THAN, 52)});
+        auto gradePane = window(text(" Grade (G to close, 0 reset) "), vbox({sliders->Render(),
+            text("arrows adjust, Tab/↑↓ move; applied to queued items") | dim}));
+        auto right = vbox({window(text(" Preview "), thumbnailElement(shown)), window(text(" Clip "), vbox(meta)),
+                           gradeMode ? gradePane : window(text(" Export "), settingsRows())});
+        Element top = showBrowser ? hbox({browserPane | flex, poolPane | flex, right | size(WIDTH, GREATER_THAN, 60)})
+                                  : hbox({poolPane | flex, right | size(WIDTH, GREATER_THAN, 60)});
         Element help = text(
-            " Enter open/import  Tab pane  Space select  a add selected  A add all  v render  x cancel  "
-            "c/g/t/e/E/l/y/h settings  b browser  ? help  q quit");
+            " Enter open/import  Tab pane  Space select  a/A queue  v render  x cancel  G grade  "
+            "c/f/g/t/e/E/l/y/h settings  , . < > preview frame  b browser  ? help  q quit");
         Element main = vbox({text(" Cinematic RAW Studio — craw-tui ") | bold | center, top | flex,
                              window(text(rendering ? " Render queue (rendering) " : " Render queue "), vbox(q)),
                              text(" " + status) | dim, help | dim});
@@ -235,7 +335,10 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
                 text("Browser: Enter opens folders and imports .craw takes into the media pool."),
                 text("Media pool: Space marks takes; a queues marked takes, A queues all."),
                 text("v starts rendering the queue, x cancels after the current frame."),
-                text("c codec, g gamut, t transfer, e/E exposure -/+ 1/3 EV,"),
+                text("c codec, f frame rate, g gamut, t transfer, e/E exposure -/+ 1/3 EV,"),
+                text("G grade mode: exposure, temperature, tint, contrast, saturation,"),
+                text("  highlights, shadows, blacks (live preview); 0 resets the grade."),
+                text(", . step the preview frame, < > jump 10 %."),
                 text("l lens-shading correction, y highlight clipping, h half resolution."),
                 text("CinemaDNG export is lossless; video codecs are rendered by FFmpeg."),
                 text("Settings apply to items when they are queued.  ? closes help."),
@@ -276,8 +379,27 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
         if (e == Event::Character('c')) { profileIdx = (profileIdx + 1) % static_cast<int>(profiles.size()); return true; }
         if (e == Event::Character('g')) { dev.gamut = cycle(dev.gamut, 1); return true; }
         if (e == Event::Character('t')) { dev.transfer = cycle(dev.transfer, 1); return true; }
-        if (e == Event::Character('e')) { dev.exposureEv -= 1.0 / 3; return true; }
-        if (e == Event::Character('E')) { dev.exposureEv += 1.0 / 3; return true; }
+        if (e == Event::Character('e')) { gEv -= 1.f / 3; return true; }
+        if (e == Event::Character('E')) { gEv += 1.f / 3; return true; }
+        if (e == Event::Character('f')) { fpsIdx = (fpsIdx + 1) % static_cast<int>(std::size(kFpsPresets)); return true; }
+        if (e == Event::Character('G')) {
+            gradeMode = !gradeMode;
+            if (gradeMode) sliders->TakeFocus(); else poolMenu->TakeFocus();
+            return true;
+        }
+        if (e == Event::Character('0') && gradeMode) {
+            gEv = gTemp = gTint = gHigh = gShadow = gBlacks = 0;
+            gContrast = gSat = 1;
+            return true;
+        }
+        if (poolSel >= 0 && poolSel < static_cast<int>(pool.size())) {
+            const size_t n = std::max<size_t>(1, pool[poolSel].frames);
+            const size_t jump = std::max<size_t>(1, n / 10);
+            if (e == Event::Character('.')) { previewFrame = std::min(previewFrame + 1, n - 1); return true; }
+            if (e == Event::Character(',')) { previewFrame = previewFrame > 0 ? previewFrame - 1 : 0; return true; }
+            if (e == Event::Character('>')) { previewFrame = std::min(previewFrame + jump, n - 1); return true; }
+            if (e == Event::Character('<')) { previewFrame = previewFrame > jump ? previewFrame - jump : 0; return true; }
+        }
         if (e == Event::Character('l')) { dev.lensCorrection = !dev.lensCorrection; return true; }
         if (e == Event::Character('y')) { dev.clipHighlights = !dev.clipHighlights; return true; }
         if (e == Event::Character('h')) { dev.halfResolution = !dev.halfResolution; return true; }
@@ -287,6 +409,12 @@ int runTui(const std::string& startDir, const std::vector<std::string>& preload,
     screen.Loop(app);
     cancel = true;
     if (worker.joinable()) worker.join();
+    {
+        std::lock_guard l(tm);
+        thumbStop = true;
+    }
+    tcv.notify_all();
+    thumbWorker.join();
     return 0;
 }
 
