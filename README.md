@@ -11,7 +11,7 @@ cmake -S . -B build -G Ninja && ninja -C build      # needs ../CinematicRAWStudi
 ./build/craw-tui ~/Movies/takes                      # or: craw-tui take.craw ...
 ```
 
-Imports both CRAW-Live and CRAW-Fast automatically; the codec stored in
+Imports CRAW-Fast, CRAW-Live, Live v2 and Desktop Compact (codec 4) automatically; the codec stored in
 each frame selects the decoder. Rebuild after updating the sibling decoder
 to pick up its WAV export fixes. CinemaDNG audio exports use integer PCM
 (16-bit source stays 16-bit; float becomes 24-bit) with Broadcast WAV
@@ -93,3 +93,13 @@ frames stream to FFmpeg in order. Transfer curves use a table indexed by the
 float bit pattern (no log/pow per sample; PSNR ~78 dB vs exact). On an
 8-core Mac, 40 frames of 4080x2040 to ProRes 422 HQ take ~8 s, of which
 FFmpeg's encoder alone needs ~4 s.
+
+## Lossless desktop compaction
+
+Run `craw compact in.craw out.craw` with the updated Spec desktop wrapper and
+Decoder/Encoder tools. Open the output in the TUI normally; browser, preview,
+CinemaDNG export and rendered exports use the shared decoder. Takes may contain
+both Compact and original-codec frames when keeping an original frame is smaller.
+Compaction preserves RAW samples, frame records and ancillary chunks. It is a
+desktop operation; Compact is substantially slower to encode and decode than
+Live v2. The phone recording codec is unchanged.
