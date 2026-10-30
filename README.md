@@ -96,6 +96,14 @@ FFmpeg's encoder alone needs ~4 s.
 
 ## Lossless desktop compaction
 
+Codec IDs are 1 Fast, 2 Live v1, 3 Live v2 and 4 Compact. They identify
+compatible payload syntax, not an unconditional speed/size ranking. “Fast”
+predates the faster Live modes. See the
+[shared benchmark guide](https://github.com/matthew777777/CinematicRAWStudio-Spec/blob/main/BENCHMARKS.md)
+and [2026-10-30 comparison](https://github.com/matthew777777/CinematicRAWStudio-Spec/tree/main/results/comparison-20261030).
+Codec-only timings exclude development, grading, FFmpeg, mount and storage;
+they cannot predict complete TUI render or editing performance.
+
 Run `craw compact in.craw out.craw` with the updated Spec desktop wrapper and
 Decoder/Encoder tools. Open the output in the TUI normally; browser, preview,
 CinemaDNG export and rendered exports use the shared decoder. Takes may contain
