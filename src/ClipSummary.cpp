@@ -20,6 +20,10 @@ ClipSummary ClipSummary::load(const std::string& path) {
         s.fps = i.fpsNum / i.fpsDen;
         s.seconds = s.fps > 0 ? s.frames / s.fps : 0;
         s.camera = i.uniqueModel;
+        if (s.frames) {
+            const auto frame = clip.reader().frame(0);
+            s.codec = craw::codecDisplayName(craw::probeFrame(frame.payload, frame.payloadSize).codec);
+        }
         static const char* cfa[] = {"RGGB", "GRBG", "GBRG", "BGGR", "RGB (binned)"};
         s.cfa = cfa[std::min<int>(clip.isRgb() ? 4 : i.cfa & 3, 4)];
         s.black = i.black[0];
@@ -56,6 +60,7 @@ std::vector<std::pair<std::string, std::string>> ClipSummary::rows() const {
     std::snprintf(buf, sizeof buf, "%zu @ %.3g fps (%.1f s)", frames, fps, seconds);
     r.emplace_back("frames", buf);
     r.emplace_back("camera", camera);
+    if (!codec.empty()) r.emplace_back("codec (first frame)", codec);
     std::snprintf(buf, sizeof buf, "%s  black %.0f  white %.0f", cfa.c_str(), black, white);
     r.emplace_back("sensor", buf);
     r.emplace_back("audio", audio);

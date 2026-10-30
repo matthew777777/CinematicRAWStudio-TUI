@@ -11,7 +11,8 @@ cmake -S . -B build -G Ninja && ninja -C build      # needs ../CinematicRAWStudi
 ./build/craw-tui ~/Movies/takes                      # or: craw-tui take.craw ...
 ```
 
-Imports CRAW-Fast, CRAW-Live, Live v2 and Desktop Compact (codec 4) automatically; the codec stored in
+Imports CRAW Balanced, CRAW Live v1 — Legacy, CRAW Live and
+CRAW Compact — Offline (IDs 1–4) automatically; the codec stored in
 each frame selects the decoder. Rebuild after updating the sibling decoder
 to pick up its WAV export fixes. CinemaDNG audio exports use integer PCM
 (16-bit source stays 16-bit; float becomes 24-bit) with Broadcast WAV
@@ -96,7 +97,7 @@ FFmpeg's encoder alone needs ~4 s.
 
 ## Lossless desktop compaction
 
-Codec IDs are 1 Fast, 2 Live v1, 3 Live v2 and 4 Compact. They identify
+Codec IDs 1–4 display as Balanced, Live v1 — Legacy, Live and Compact — Offline. They identify
 compatible payload syntax, not an unconditional speed/size ranking. “Fast”
 predates the faster Live modes. See the
 [shared benchmark guide](https://github.com/matthew777777/CinematicRAWStudio-Spec/blob/main/BENCHMARKS.md)
@@ -111,3 +112,20 @@ both Compact and original-codec frames when keeping an original frame is smaller
 Compaction preserves RAW samples, frame records and ancillary chunks. It is a
 desktop operation; Compact is substantially slower to encode and decode than
 Live v2. The phone recording codec is unchanged.
+
+
+## Codec display names
+
+| ID | Display name | Historical names / aliases |
+|---:|---|---|
+| 1 | **CRAW Balanced** | CRAW-Fast, Fast |
+| 2 | **CRAW Live v1 — Legacy** | CRAW-Live, CRAW-Live v1, Live v1 |
+| 3 | **CRAW Live** | CRAW-Live v2, Live v2 |
+| 4 | **CRAW Compact — Offline** | CRAW-Compact, Desktop Compact |
+
+These are display names. Codec IDs, encoded bytes, saved numeric preferences
+and legacy metadata strings retain their existing meanings. Existing recordings
+are not rewritten. Historical benchmark reports keep their original labels;
+use the IDs to match them to this table. Balanced describes the intended
+size/CPU tradeoff, not a guarantee of the smallest files. Live is the current
+recording choice; Live v1 is retained for compatibility and Compact is offline.

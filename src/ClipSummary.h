@@ -17,7 +17,7 @@ struct ClipSummary {
     size_t frames = 0;
     double fps = 0, seconds = 0, bitsPerPixel = 0;
     uint64_t fileBytes = 0;
-    std::string camera, cfa, audio;
+    std::string camera, cfa, audio, codec;
     double black = 0, white = 0;
     bool lensShading = false;
 
